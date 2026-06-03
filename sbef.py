@@ -19,7 +19,7 @@ class SparseBayesExpander:
 
     def __init__(self, D, Q, a_alpha0=20.0, b_alpha0=1e-6, a_beta0=1e-6, b_beta0=1e-6,
                  alpha_threshold=np.exp(20), max_iter=200, tol=1e-6, verbose=False,
-                 symmetry='none', tie_alpha_across_rows=False):
+                 symmetry='hv', tie_alpha_across_rows=True):
         self.D = D
         self.Q = Q
         self.a_alpha0 = a_alpha0

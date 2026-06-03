@@ -61,11 +61,15 @@ def extract_patches(img, r=2, m=11, train_mode=False):
         Y = patches.reshape(-1, Q).T
 
     # corresponding high-res patches: for each low patch take r x r block
+    # When train_mode=True, low-res patches were taken starting from offset
+    # `pad` (boundary patches discarded), so high-res patches must also start
+    # from (pad*r, pad*r) to keep correct spatial correspondence.
+    offset = pad if train_mode else 0
     X_list = []
     for i in range(Hs):
         for j in range(Ws):
-            hi = i * r
-            hj = j * r
+            hi = (i + offset) * r
+            hj = (j + offset) * r
             xr = img[hi:hi+r, hj:hj+r].reshape(-1)
             X_list.append(xr)
     X = np.array(X_list).T  # D x N
@@ -85,7 +89,6 @@ def main():
     r = args.r if args.r is not None else R
     m = args.m if args.m is not None else M
     mode = args.mode
-    img = None
     # r and m potentially set by command-line
     # r = magnification factor, m = low-res patch size
     # If user provided a training directory, we'll build train/test sets from files.
@@ -101,7 +104,6 @@ def main():
     if train_dir is None and test_dir is None:
         parser.error('Please provide at least --train-dir or --test-dir (no default astronaut fallback).')
 
-    reconstructed = np.zeros_like(img)
     learned_kernels = []
 
     out_dir = Path.cwd() / 'demo_outputs'
@@ -139,7 +141,7 @@ def main():
                     continue
                 if im.ndim == 2:
                     im = np.stack([im, im, im], axis=2)
-                im = im.astype(np.float32) / 255.0
+                im = im.astype(np.float64) / 255.0
                 imgs.append(im)
         return imgs
 
@@ -180,7 +182,7 @@ def main():
                 Wc = (W // r) * r
                 tr = tr[:Hc, :Wc]
                 for ch in range(3):
-                    Yt, Xt = extract_patches(tr[:, :, ch], r=r, m=m)
+                    Yt, Xt = extract_patches(tr[:, :, ch], r=r, m=m, train_mode=True)
                     channel_train_data[ch].append((Yt, Xt))
             for ch in range(3):
                 Ys = [t[0] for t in channel_train_data[ch]]
@@ -206,7 +208,7 @@ def main():
                 tr = tr[:Hc, :Wc]
                 tri = rgb_to_yiq(tr)
                 # use luminance channel (0)
-                Yt, Xt = extract_patches(tri[:, :, 0], r=r, m=m)
+                Yt, Xt = extract_patches(tri[:, :, 0], r=r, m=m, train_mode=True)
                 Y_channel_patches.append((Yt, Xt))
             if not Y_channel_patches:
                 raise SystemExit('No training patches found for Y channel; provide training images.')
@@ -229,7 +231,7 @@ def main():
                 tr = tr[:Hc, :Wc]
                 tri = rgb_to_yiq(tr)
                 for ch in range(3):
-                    Yt, Xt = extract_patches(tri[:, :, ch], r=r, m=m)
+                    Yt, Xt = extract_patches(tri[:, :, ch], r=r, m=m,train_mode=True)
                     channel_train_data[ch].append((Yt, Xt))
             for ch in range(3):
                 Ys = [t[0] for t in channel_train_data[ch]]
