@@ -1,7 +1,7 @@
 import numpy as np
 from skimage import data, transform
 from skimage.util import view_as_windows
-from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import peak_signal_noise_ratio as sk_psnr
 from sbef import SparseBayesExpander
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -18,30 +18,52 @@ M = 11  # low-resolution patch size (m)
 # --------------------
 
 
-def extract_patches(img, r=2, m=11):
-    # img: HxW (single channel)
+def extract_patches(img, r=2, m=11, train_mode=False):
+    """Extract low/high patches according to the paper's experiment.
+
+    - High-res patches: non-overlapping r x r blocks taken from the image grid.
+    - Low-res: blur with cubic kernel and subsample by r (implemented with
+      transform.resize(order=3, anti_aliasing=True, preserve_range=True)).
+    - For training (train_mode=True): discard low-res patches that rely on
+      padding at the image boundary (paper: discard boundary patches).
+    - For test (train_mode=False): extend the low-res image by pixel
+      replication (pad with mode='edge') before extracting overlapping patches.
+    Returns Y (Q x N) and X (D x N) where Q = m*m and D = r*r.
+    """
     H, W = img.shape
-    # create high-res non-overlapping patches of size r x r
+    # crop to a multiple of r so high-res blocks are exact
     Hr = (H // r) * r
     Wr = (W // r) * r
     img = img[:Hr, :Wr]
-    # downsample (anti-alias with simple blur) then upsample to create low-res
-    low = transform.rescale(img, 1.0 / r, anti_aliasing=True)
-    # pad low to allow extraction of m x m overlapping patches
+
+    # create low-resolution image by cubic anti-aliased resize
+    low = transform.resize(img, (Hr // r, Wr // r), order=3, anti_aliasing=True, preserve_range=True)
+
     pad = m // 2
-    low_padded = np.pad(low, pad, mode='reflect')
+    # For test-mode we must extend low by pixel replication (edge) as the paper
+    # requires. For training we still pad to allow extracting patches, but we
+    # will discard boundary patches afterwards.
+    low_padded = np.pad(low, pad, mode='edge')
     patches = view_as_windows(low_padded, (m, m))  # shape (H', W', m, m)
-    # flatten patches into Q vector
     Hs, Ws = patches.shape[:2]
     Q = m * m
-    Y = patches.reshape(-1, Q).T  # Q x N
 
-    # corresponding high-res patches: for each low patch center at (i+pad,j+pad)
-    # take r x r patch in high-res at position (i*r, j*r)
+    if train_mode:
+        # discard patches whose centers were within 'pad' pixels of the low-res border
+        Hs_valid = Hs - 2 * pad
+        Ws_valid = Ws - 2 * pad
+        if Hs_valid <= 0 or Ws_valid <= 0:
+            Y = patches.reshape(-1, Q).T
+        else:
+            Y = patches[pad:pad+Hs_valid, pad:pad+Ws_valid, :, :].reshape(-1, Q).T
+            Hs, Ws = Hs_valid, Ws_valid
+    else:
+        Y = patches.reshape(-1, Q).T
+
+    # corresponding high-res patches: for each low patch take r x r block
     X_list = []
     for i in range(Hs):
         for j in range(Ws):
-            # map to high-res coordinates
             hi = i * r
             hj = j * r
             xr = img[hi:hi+r, hj:hj+r].reshape(-1)
@@ -62,10 +84,8 @@ def main():
     # Use CLI args if provided, otherwise fall back to top-level CONFIG
     r = args.r if args.r is not None else R
     m = args.m if args.m is not None else M
-    # build a test RGB image (astronaut) and crop
-    img = data.astronaut()
-    img = img.astype(np.float32) / 255.0
     mode = args.mode
+    img = None
     # r and m potentially set by command-line
     # r = magnification factor, m = low-res patch size
     # If user provided a training directory, we'll build train/test sets from files.
@@ -79,8 +99,7 @@ def main():
         test_dir = Path(TEST_DIR)
 
     if train_dir is None and test_dir is None:
-        # default: small crop of astronaut for speed
-        img = img[:128, :128]
+        parser.error('Please provide at least --train-dir or --test-dir (no default astronaut fallback).')
 
     reconstructed = np.zeros_like(img)
     learned_kernels = []
@@ -124,6 +143,9 @@ def main():
                 imgs.append(im)
         return imgs
 
+    # Use the standard single-channel PSNR (skimage convention):
+    # PSNR = 10 * log10(1 / MSE) where pixel range is [0,1].
+
     # If train/test dirs provided, prepare lists
     train_imgs = []
     test_imgs = []
@@ -164,8 +186,7 @@ def main():
                 Ys = [t[0] for t in channel_train_data[ch]]
                 Xs = [t[1] for t in channel_train_data[ch]]
                 if not Ys:
-                    Ys, Xs = extract_patches(img[:, :, ch], r=r, m=m)
-                    Ys = [Ys]; Xs = [Xs]
+                    raise SystemExit('No training patches found for channel; provide training images.')
                 Y_all = np.concatenate(Ys, axis=1)
                 X_all = np.concatenate(Xs, axis=1)
                 D = X_all.shape[0]
@@ -188,8 +209,7 @@ def main():
                 Yt, Xt = extract_patches(tri[:, :, 0], r=r, m=m)
                 Y_channel_patches.append((Yt, Xt))
             if not Y_channel_patches:
-                Yt, Xt = extract_patches(rgb_to_yiq(img)[:, :, 0], r=r, m=m)
-                Y_channel_patches = [(Yt, Xt)]
+                raise SystemExit('No training patches found for Y channel; provide training images.')
             Y_all = np.concatenate([t[0] for t in Y_channel_patches], axis=1)
             X_all = np.concatenate([t[1] for t in Y_channel_patches], axis=1)
             D = X_all.shape[0]
@@ -215,10 +235,7 @@ def main():
                 Ys = [t[0] for t in channel_train_data[ch]]
                 Xs = [t[1] for t in channel_train_data[ch]]
                 if not Ys:
-                    # fallback to default astronaut (converted to YIQ)
-                    tri = rgb_to_yiq(img)
-                    Ys, Xs = extract_patches(tri[:, :, ch], r=r, m=m)
-                    Ys = [Ys]; Xs = [Xs]
+                    raise SystemExit('No training patches found for channel; provide training images.')
                 Y_all = np.concatenate(Ys, axis=1)
                 X_all = np.concatenate(Xs, axis=1)
                 D = X_all.shape[0]
@@ -228,7 +245,7 @@ def main():
                 learned_kernels.append(model.M.copy())
                 models.append(model)
     else:
-        print('No training images provided, using default astronaut crop for training. PSNR will be computed against this image. To use your own training images, provide a directory path with --train-dir containing image files (png,jpg,jpeg,tif,bmp).')
+        print('No training images provided.')
 
     if test_imgs:
         reconstructed_imgs = []
@@ -241,10 +258,10 @@ def main():
             rec = np.zeros_like(tt)
             if mode == 'rgb':
                 for ch in range(3):
-                    low = transform.rescale(tt[:, :, ch], 1.0 / r, anti_aliasing=True)
+                    low = transform.resize(tt[:, :, ch], (Hc // r, Wc // r), order=3, anti_aliasing=True, preserve_range=True)
                     Hs, Ws = low.shape
                     pad = m // 2
-                    low_padded = np.pad(low, pad, mode='reflect')
+                    low_padded = np.pad(low, pad, mode='edge')
                     out = np.zeros((Hs * r, Ws * r))
                     for i in range(Hs):
                         for j in range(Ws):
@@ -258,10 +275,10 @@ def main():
                 # convert test image to YIQ; expand Y with learned model, I/Q with cubic
                 t_yiq = rgb_to_yiq(tt)
                 # expand Y channel
-                lowY = transform.rescale(t_yiq[:, :, 0], 1.0 / r, anti_aliasing=True)
+                lowY = transform.resize(t_yiq[:, :, 0], (Hc // r, Wc // r), order=3, anti_aliasing=True, preserve_range=True)
                 Hs, Ws = lowY.shape
                 pad = m // 2
-                lowY_padded = np.pad(lowY, pad, mode='reflect')
+                lowY_padded = np.pad(lowY, pad, mode='edge')
                 outY = np.zeros((Hs * r, Ws * r))
                 for i in range(Hs):
                     for j in range(Ws):
@@ -288,10 +305,10 @@ def main():
                 t_yiq = rgb_to_yiq(tt)
                 rec_yiq = np.zeros_like(t_yiq)
                 for ch in range(3):
-                    low = transform.rescale(t_yiq[:, :, ch], 1.0 / r, anti_aliasing=True)
+                    low = transform.resize(t_yiq[:, :, ch], (Hc // r, Wc // r), order=3, anti_aliasing=True, preserve_range=True)
                     Hs, Ws = low.shape
                     pad = m // 2
-                    low_padded = np.pad(low, pad, mode='reflect')
+                    low_padded = np.pad(low, pad, mode='edge')
                     out = np.zeros((Hs * r, Ws * r))
                     for i in range(Hs):
                         for j in range(Ws):
@@ -305,17 +322,17 @@ def main():
                 rec_rgb = yiq_to_rgb(rec_yiq)
                 rec = np.clip(rec_rgb, 0, 1)
             reconstructed_imgs.append(rec)
-            psnr_list.append(psnr(tt, rec, data_range=1.0))
+            psnr_list.append(sk_psnr(tt, rec, data_range=1.0))
         val_learned = float(np.mean(psnr_list))
         print('Mean PSNR on test set (learned):', val_learned)
         # take first test image for visualization
         img = test_imgs[0]
         reconstructed = reconstructed_imgs[0]
     else:
-        print('No test images provided, running demo on default astronaut crop. PSNR will be computed against this image.')
+        parser.error('No test images provided. Please supply --test-dir with images to run the demo (no astronaut fallback).')
 
-    # compute PSNR for learned expander
-    val_learned = psnr(img, reconstructed, data_range=1.0)
+    # compute PSNR for learned expander (standard single-channel convention)
+    val_learned = sk_psnr(img, reconstructed, data_range=1.0)
     print('PSNR RGB reconstructed vs original (learned):', val_learned)
 
     # prepare cubic baseline: downsample then upsample with cubic (explicit shapes)
@@ -326,7 +343,7 @@ def main():
     # ensure in [0,1]
     low_rgb = np.clip(low_rgb, 0, 1)
     cubic = np.clip(cubic, 0, 1)
-    val_cubic = psnr(img, cubic, data_range=1.0)
+    val_cubic = sk_psnr(img, cubic, data_range=1.0)
     print('PSNR cubic baseline:', val_cubic)
 
     # save comparison images

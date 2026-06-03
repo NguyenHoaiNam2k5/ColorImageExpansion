@@ -9,7 +9,7 @@ class SparseBayesExpander:
     using the variational updates in Kanemura et al. (2009).
     """
     def __init__(self, D, Q, a_alpha0=20.0, b_alpha0=1e-6, a_beta0=1e-6, b_beta0=1e-6,
-                 alpha_threshold=1e20, max_iter=200, tol=1e-6, verbose=False):
+                 alpha_threshold=np.exp(20), max_iter=200, tol=1e-6, verbose=False):
         self.D = D
         self.Q = Q
         self.a_alpha0 = a_alpha0
