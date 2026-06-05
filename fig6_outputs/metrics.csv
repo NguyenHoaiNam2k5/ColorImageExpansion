@@ -1,0 +1,5 @@
+method,filename,psnr_db
+Cubic,cubic.png,32.419941
+Y + cubic,y_plus_cubic.png,33.286783
+RGB,rgb.png,33.480074
+YIQ,yiq.png,33.476672

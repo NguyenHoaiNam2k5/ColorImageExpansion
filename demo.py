@@ -1,410 +1,375 @@
-import numpy as np
-from skimage import data, transform
-from skimage.util import view_as_windows
-from skimage.metrics import peak_signal_noise_ratio as sk_psnr
-from sbef import SparseBayesExpander
-from pathlib import Path
-import matplotlib.pyplot as plt
 import argparse
-from skimage import io
+from pathlib import Path
 
-# --------------------
-# CONFIG: edit these values directly to set dataset and patch params
-# Set TRAIN_DIR/TEST_DIR to a string path to your folders, or None to use defaults
-TRAIN_DIR = r"data\train"
-TEST_DIR = r"data\test"
-R = 2   # magnification factor (r)
-M = 11  # low-resolution patch size (m)
-# --------------------
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy import ndimage
+from skimage import io, transform
+from skimage.metrics import peak_signal_noise_ratio as sk_psnr
+from skimage.util import view_as_windows
+
+from sbef import SparseBayesExpander
 
 
-def extract_patches(img, r=2, m=11, train_mode=False):
-    """Extract low/high patches according to the paper's experiment.
+TRAIN_DIR = 'data/train'
+TEST_DIR = 'data/test'
+R = 2
+PATCH_SIZE = 11
+A_ALPHA0 = 20.0
+CUBIC_KERNEL_A = -0.5
 
-    - High-res patches: non-overlapping r x r blocks taken from the image grid.
-    - Low-res: blur with cubic kernel and subsample by r (implemented with
-      transform.resize(order=3, anti_aliasing=True, preserve_range=True)).
-    - For training (train_mode=True): discard low-res patches that rely on
-      padding at the image boundary (paper: discard boundary patches).
-    - For test (train_mode=False): extend the low-res image by pixel
-      replication (pad with mode='edge') before extracting overlapping patches.
-    Returns Y (Q x N) and X (D x N) where Q = m*m and D = r*r.
+RGB_TO_YIQ = np.array([
+    [0.299, 0.587, 0.114],
+    [0.596, -0.274, -0.322],
+    [0.211, -0.523, 0.312],
+], dtype=np.float64)
+YIQ_TO_RGB = np.linalg.inv(RGB_TO_YIQ)
+
+
+def rgb_to_yiq(img):
+    flat = img.reshape(-1, 3)
+    return (flat @ RGB_TO_YIQ.T).reshape(img.shape)
+
+
+def yiq_to_rgb(img):
+    flat = img.reshape(-1, 3)
+    return (flat @ YIQ_TO_RGB.T).reshape(img.shape)
+
+
+def crop_to_factor(img, r):
+    h, w = img.shape[:2]
+    return img[:(h // r) * r, :(w // r) * r]
+
+
+def cubic_kernel(x, a=CUBIC_KERNEL_A):
+    """Keys cubic convolution kernel used for the anti-aliasing blur."""
+    x = np.abs(np.asarray(x, dtype=np.float64))
+    weights = np.zeros_like(x)
+
+    mask1 = x <= 1
+    weights[mask1] = (
+        (a + 2) * x[mask1] ** 3
+        - (a + 3) * x[mask1] ** 2
+        + 1
+    )
+
+    mask2 = (x > 1) & (x < 2)
+    weights[mask2] = (
+        a * x[mask2] ** 3
+        - 5 * a * x[mask2] ** 2
+        + 8 * a * x[mask2]
+        - 4 * a
+    )
+
+    return weights
+
+
+def cubic_antialias_filter(r):
+    """Return a scaled cubic low-pass kernel for decimation by factor r."""
+    if r < 1:
+        raise ValueError('r must be a positive integer')
+    radius = 2 * int(r)
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = cubic_kernel(offsets / float(r)) / float(r)
+    kernel_sum = np.sum(kernel)
+    if not np.isfinite(kernel_sum) or abs(kernel_sum) < 1e-12:
+        raise ValueError(f'invalid cubic anti-aliasing kernel for r={r}')
+    return kernel / kernel_sum
+
+
+def make_low_resolution(img, r):
+    """Create the low-resolution image by cubic blur followed by subsampling.
+
+    The paper states this step as cubic-kernel anti-aliasing followed by
+    subsampling by the expansion factor.  This function keeps those two steps
+    explicit instead of using a combined resize call.
     """
-    H, W = img.shape
-    # crop to a multiple of r so high-res blocks are exact
-    Hr = (H // r) * r
-    Wr = (W // r) * r
-    img = img[:Hr, :Wr]
+    img = np.asarray(img, dtype=np.float64)
+    kernel = cubic_antialias_filter(r)
+    blurred = ndimage.convolve1d(img, kernel, axis=0, mode='nearest')
+    blurred = ndimage.convolve1d(blurred, kernel, axis=1, mode='nearest')
+    return blurred[::r, ::r, ...].astype(np.float64)
 
-    # create low-resolution image by cubic anti-aliased resize
-    low = transform.resize(img, (Hr // r, Wr // r), order=3, anti_aliasing=True, preserve_range=True)
 
+def cubic_expand(img, out_shape):
+    img = np.asarray(img, dtype=np.float64)
+
+    if img.ndim == 2:
+        in_h, in_w = img.shape
+        out_h, out_w = out_shape
+        r_h = out_h / in_h
+        r_w = out_w / in_w
+
+        yy = np.arange(out_h, dtype=np.float64) / r_h
+        xx = np.arange(out_w, dtype=np.float64) / r_w
+        coords = np.meshgrid(yy, xx, indexing='ij')
+
+        return ndimage.map_coordinates(
+            img,
+            coords,
+            order=3,
+            mode='nearest'
+        ).astype(np.float64)
+
+    channels = [
+        cubic_expand(img[:, :, c], out_shape[:2])
+        for c in range(img.shape[2])
+    ]
+    return np.stack(channels, axis=2)
+
+
+def extract_patches(channel, r=2, m=11, train_mode=False):
+    """Return one-channel patch matrices Y and X.
+
+    High-resolution patches are non-overlapping r x r blocks.  In training mode
+    boundary low-resolution patches are discarded.  In test/application mode the
+    low-resolution image is extended by pixel replication before extracting
+    patches.
+    """
+    channel = crop_to_factor(np.asarray(channel, dtype=np.float64), r)
+    low = make_low_resolution(channel, r)
     pad = m // 2
-    # For test-mode we must extend low by pixel replication (edge) as the paper
-    # requires. For training we still pad to allow extracting patches, but we
-    # will discard boundary patches afterwards.
     low_padded = np.pad(low, pad, mode='edge')
-    patches = view_as_windows(low_padded, (m, m))  # shape (H', W', m, m)
-    Hs, Ws = patches.shape[:2]
-    Q = m * m
+    all_patches = view_as_windows(low_padded, (m, m))
+    h_low, w_low = low.shape
 
     if train_mode:
-        # discard patches whose centers were within 'pad' pixels of the low-res border
-        Hs_valid = Hs - 2 * pad
-        Ws_valid = Ws - 2 * pad
-        if Hs_valid <= 0 or Ws_valid <= 0:
-            Y = patches.reshape(-1, Q).T
-        else:
-            Y = patches[pad:pad+Hs_valid, pad:pad+Ws_valid, :, :].reshape(-1, Q).T
-            Hs, Ws = Hs_valid, Ws_valid
+        if h_low <= 2 * pad or w_low <= 2 * pad:
+            raise ValueError(f'image is too small for m={m}; low-res size is {low.shape}')
+        centers_i = range(pad, h_low - pad)
+        centers_j = range(pad, w_low - pad)
     else:
-        Y = patches.reshape(-1, Q).T
+        centers_i = range(h_low)
+        centers_j = range(w_low)
 
-    # corresponding high-res patches: for each low patch take r x r block
-    # When train_mode=True, low-res patches were taken starting from offset
-    # `pad` (boundary patches discarded), so high-res patches must also start
-    # from (pad*r, pad*r) to keep correct spatial correspondence.
-    offset = pad if train_mode else 0
-    X_list = []
-    for i in range(Hs):
-        for j in range(Ws):
-            hi = (i + offset) * r
-            hj = (j + offset) * r
-            xr = img[hi:hi+r, hj:hj+r].reshape(-1)
-            X_list.append(xr)
-    X = np.array(X_list).T  # D x N
-    return Y, X
+    y_cols = []
+    x_cols = []
+    for i in centers_i:
+        for j in centers_j:
+            y_cols.append(all_patches[i, j].reshape(-1))
+            x_cols.append(channel[i * r:(i + 1) * r, j * r:(j + 1) * r].reshape(-1))
+
+    return np.asarray(y_cols, dtype=np.float64).T, np.asarray(x_cols, dtype=np.float64).T
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Demo: Sparse Bayesian Image Expansion')
-    parser.add_argument('--train-dir', type=str, default=None, help='directory with training images')
-    parser.add_argument('--test-dir', type=str, default=None, help='directory with test images')
-    parser.add_argument('--r', type=int, default=None, help='magnification factor (overrides config R)')
-    parser.add_argument('--m', type=int, default=None, help='low-res patch size (overrides config M)')
-    parser.add_argument('--mode', type=str, default='rgb', choices=['rgb', 'yiq-luma', 'yiq-all'], help='expansion mode: rgb (learn each RGB), yiq-luma (learn Y only, cubic for I/Q), yiq-all (learn Y,I,Q)')
-    args = parser.parse_args()
+def expand_channel(model, channel, r=2, m=11):
+    channel = crop_to_factor(np.asarray(channel, dtype=np.float64), r)
+    low = make_low_resolution(channel, r)
+    pad = m // 2
+    low_padded = np.pad(low, pad, mode='edge')
+    h_low, w_low = low.shape
+    out = np.zeros((h_low * r, w_low * r), dtype=np.float64)
 
-    # Use CLI args if provided, otherwise fall back to top-level CONFIG
-    r = args.r if args.r is not None else R
-    m = args.m if args.m is not None else M
-    mode = args.mode
-    # r and m potentially set by command-line
-    # r = magnification factor, m = low-res patch size
-    # If user provided a training directory, we'll build train/test sets from files.
-    train_dir = None if args.train_dir is None else Path(args.train_dir)
-    # if CLI not provided, use config strings (which may be None)
-    if train_dir is None and TRAIN_DIR:
-        train_dir = Path(TRAIN_DIR)
+    for i in range(h_low):
+        for j in range(w_low):
+            patch = low_padded[i:i + m, j:j + m].reshape(-1)
+            out[i * r:(i + 1) * r, j * r:(j + 1) * r] = model.transform_patch(patch).reshape((r, r))
 
-    test_dir = None if args.test_dir is None else Path(args.test_dir)
-    if test_dir is None and TEST_DIR:
-        test_dir = Path(TEST_DIR)
+    return out[:channel.shape[0], :channel.shape[1]], low
 
-    if train_dir is None and test_dir is None:
-        parser.error('Please provide at least --train-dir or --test-dir (no default astronaut fallback).')
 
-    learned_kernels = []
+def load_images_from_dir(directory):
+    allowed = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
+    imgs = []
+    for path in sorted(Path(directory).rglob('*')):
+        if not path.is_file() or path.suffix.lower() not in allowed:
+            continue
+        try:
+            im = io.imread(str(path))
+        except Exception as exc:
+            print(f'Warning: failed to read image {path}: {exc}')
+            continue
+        if im.ndim == 2:
+            im = np.stack([im, im, im], axis=2)
+        if im.ndim == 3 and im.shape[2] > 3:
+            im = im[:, :, :3]
+        im = im.astype(np.float64)
+        if im.max() > 1.0:
+            im /= 255.0
+        imgs.append(np.clip(im, 0.0, 1.0))
+    return imgs
 
-    out_dir = Path.cwd() / 'demo_outputs'
-    out_dir.mkdir(exist_ok=True)
 
-    # color conversion helpers for YIQ
-    M_rgb2yiq = np.array([[0.299,  0.587,  0.114],
-                          [0.596, -0.274, -0.322],
-                          [0.211, -0.523,  0.312]])
-    M_yiq2rgb = np.linalg.inv(M_rgb2yiq)
+def channel_training_data(images, channel_fn, r, m):
+    ys = []
+    xs = []
+    for img in images:
+        channel = channel_fn(crop_to_factor(img, r))
+        y, x = extract_patches(channel, r=r, m=m, train_mode=True)
+        ys.append(y)
+        xs.append(x)
+    return np.concatenate(ys, axis=1), np.concatenate(xs, axis=1)
 
-    def rgb_to_yiq(img):
-        shp = img.shape
-        flat = img.reshape(-1, 3)
-        yiq = flat @ M_rgb2yiq.T
-        return yiq.reshape(shp)
 
-    def yiq_to_rgb(img):
-        shp = img.shape
-        flat = img.reshape(-1, 3)
-        rgb = flat @ M_yiq2rgb.T
-        return rgb.reshape(shp)
+def fit_one_channel(y, x, args):
+    model = SparseBayesExpander(
+        D=x.shape[0], Q=y.shape[0], a_alpha0=args.a_alpha0,
+        b_alpha0=args.b_alpha0, a_beta0=args.a_beta0, b_beta0=args.b_beta0,
+        alpha_threshold=np.exp(20), max_iter=args.max_iter, tol=args.tol,
+        verbose=args.verbose, symmetry=args.symmetry,
+    )
+    return model.fit(y, x)
 
-    def load_images_from_dir(d):
-        # load common image types (recursive); accept .tif and .tiff, case-insensitive
-        allowed = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
-        imgs = []
-        # walk recursively to find files with allowed suffixes
-        for p in sorted(Path(d).rglob('*')):
-            if p.is_file() and p.suffix.lower() in allowed:
-                try:
-                    im = io.imread(str(p))
-                except Exception as e:
-                    print(f'Warning: failed to read image {p!s}: {e}')
-                    continue
-                if im.ndim == 2:
-                    im = np.stack([im, im, im], axis=2)
-                im = im.astype(np.float64) / 255.0
-                imgs.append(im)
-        return imgs
 
-    # Use the standard single-channel PSNR (skimage convention):
-    # PSNR = 10 * log10(1 / MSE) where pixel range is [0,1].
-
-    # If train/test dirs provided, prepare lists
-    train_imgs = []
-    test_imgs = []
-    if train_dir is not None:
-        if train_dir.exists():
-            train_imgs = load_images_from_dir(train_dir)
-            if not train_imgs:
-                print(f'Warning: no training images found in {train_dir!s} (patterns: png,jpg,jpeg,tif,bmp)')
-            else:
-                print(f'Loaded {len(train_imgs)} training images from {train_dir!s}')
-        else:
-            print(f'Warning: TRAIN_DIR provided but path does not exist: {train_dir!s}')
-    if test_dir is not None:
-        if test_dir.exists():
-            test_imgs = load_images_from_dir(test_dir)
-            if not test_imgs:
-                print(f'Warning: no test images found in {test_dir!s} (patterns: png,jpg,jpeg,tif,bmp)')
-            else:
-                print(f'Loaded {len(test_imgs)} test images from {test_dir!s}')
-        else:
-            print(f'Warning: TEST_DIR provided but path does not exist: {test_dir!s}')
-
-    # Training data: either single default image (astronaut crop) or images from train_dir
-    if train_imgs:
-        models = []
-        if mode == 'rgb':
-            # accumulate patches for each channel across all training images
-            channel_train_data = [[], [], []]
-            for tr in train_imgs:
-                H, W = tr.shape[:2]
-                Hc = (H // r) * r
-                Wc = (W // r) * r
-                tr = tr[:Hc, :Wc]
-                for ch in range(3):
-                    Yt, Xt = extract_patches(tr[:, :, ch], r=r, m=m, train_mode=True)
-                    channel_train_data[ch].append((Yt, Xt))
-            for ch in range(3):
-                Ys = [t[0] for t in channel_train_data[ch]]
-                Xs = [t[1] for t in channel_train_data[ch]]
-                if not Ys:
-                    raise SystemExit('No training patches found for channel; provide training images.')
-                Y_all = np.concatenate(Ys, axis=1)
-                X_all = np.concatenate(Xs, axis=1)
-                D = X_all.shape[0]
-                Q = Y_all.shape[0]
-                model = SparseBayesExpander(D, Q, a_alpha0=20.0, max_iter=200, verbose=True)
-                model.fit(Y_all, X_all)
-                learned_kernels.append(model.M.copy())
-                models.append(model)
-        elif mode == 'yiq-luma':
-            # convert training images to YIQ and only train on Y channel
-            Y_channel_patches = []
-            X_channel_patches = []
-            for tr in train_imgs:
-                H, W = tr.shape[:2]
-                Hc = (H // r) * r
-                Wc = (W // r) * r
-                tr = tr[:Hc, :Wc]
-                tri = rgb_to_yiq(tr)
-                # use luminance channel (0)
-                Yt, Xt = extract_patches(tri[:, :, 0], r=r, m=m, train_mode=True)
-                Y_channel_patches.append((Yt, Xt))
-            if not Y_channel_patches:
-                raise SystemExit('No training patches found for Y channel; provide training images.')
-            Y_all = np.concatenate([t[0] for t in Y_channel_patches], axis=1)
-            X_all = np.concatenate([t[1] for t in Y_channel_patches], axis=1)
-            D = X_all.shape[0]
-            Q = Y_all.shape[0]
-            modelY = SparseBayesExpander(D, Q, a_alpha0=20.0, max_iter=200, verbose=True)
-            modelY.fit(Y_all, X_all)
-            # models[0] will be used for luminance; for I/Q we won't have models (use cubic)
-            learned_kernels.append(modelY.M.copy())
-            models.append(modelY)
-        elif mode == 'yiq-all':
-            # convert training images to YIQ and train a model for each Y,I,Q channel
-            channel_train_data = [[], [], []]
-            for tr in train_imgs:
-                H, W = tr.shape[:2]
-                Hc = (H // r) * r
-                Wc = (W // r) * r
-                tr = tr[:Hc, :Wc]
-                tri = rgb_to_yiq(tr)
-                for ch in range(3):
-                    Yt, Xt = extract_patches(tri[:, :, ch], r=r, m=m,train_mode=True)
-                    channel_train_data[ch].append((Yt, Xt))
-            for ch in range(3):
-                Ys = [t[0] for t in channel_train_data[ch]]
-                Xs = [t[1] for t in channel_train_data[ch]]
-                if not Ys:
-                    raise SystemExit('No training patches found for channel; provide training images.')
-                Y_all = np.concatenate(Ys, axis=1)
-                X_all = np.concatenate(Xs, axis=1)
-                D = X_all.shape[0]
-                Q = Y_all.shape[0]
-                model = SparseBayesExpander(D, Q, a_alpha0=20.0, max_iter=200, verbose=True)
-                model.fit(Y_all, X_all)
-                learned_kernels.append(model.M.copy())
-                models.append(model)
-    else:
-        print('No training images provided.')
-
-    if test_imgs:
-        reconstructed_imgs = []
-        psnr_list = []
-        for tt in test_imgs:
-            Ht, Wt = tt.shape[:2]
-            Hc = (Ht // r) * r
-            Wc = (Wt // r) * r
-            tt = tt[:Hc, :Wc]
-            rec = np.zeros_like(tt)
-            if mode == 'rgb':
-                for ch in range(3):
-                    low = transform.resize(tt[:, :, ch], (Hc // r, Wc // r), order=3, anti_aliasing=True, preserve_range=True)
-                    Hs, Ws = low.shape
-                    pad = m // 2
-                    low_padded = np.pad(low, pad, mode='edge')
-                    out = np.zeros((Hs * r, Ws * r))
-                    for i in range(Hs):
-                        for j in range(Ws):
-                            patch = low_padded[i:i+m, j:j+m].reshape(-1)
-                            xr = models[ch].transform_patch(patch)
-                            hi = i * r
-                            hj = j * r
-                            out[hi:hi+r, hj:hj+r] = xr.reshape((r, r))
-                    rec[:, :, ch] = out[:tt.shape[0], :tt.shape[1]]
-            elif mode == 'yiq-luma':
-                # convert test image to YIQ; expand Y with learned model, I/Q with cubic
-                t_yiq = rgb_to_yiq(tt)
-                # expand Y channel
-                lowY = transform.resize(t_yiq[:, :, 0], (Hc // r, Wc // r), order=3, anti_aliasing=True, preserve_range=True)
-                Hs, Ws = lowY.shape
-                pad = m // 2
-                lowY_padded = np.pad(lowY, pad, mode='edge')
-                outY = np.zeros((Hs * r, Ws * r))
-                for i in range(Hs):
-                    for j in range(Ws):
-                        patch = lowY_padded[i:i+m, j:j+m].reshape(-1)
-                        xr = models[0].transform_patch(patch)
-                        hi = i * r
-                        hj = j * r
-                        outY[hi:hi+r, hj:hj+r] = xr.reshape((r, r))
-                # I/Q via cubic: downsample then upsample
-                Hlow = tt.shape[0] // r
-                Wlow = tt.shape[1] // r
-                low_i = transform.resize(t_yiq[:, :, 1], (Hlow, Wlow), order=3, anti_aliasing=True, preserve_range=True)
-                low_q = transform.resize(t_yiq[:, :, 2], (Hlow, Wlow), order=3, anti_aliasing=True, preserve_range=True)
-                cubic_i = transform.resize(low_i, (tt.shape[0], tt.shape[1]), order=3, anti_aliasing=True, preserve_range=True)
-                cubic_q = transform.resize(low_q, (tt.shape[0], tt.shape[1]), order=3, anti_aliasing=True, preserve_range=True)
-                # assemble yiq reconstructed
-                rec_yiq = np.stack([outY[:tt.shape[0], :tt.shape[1]], cubic_i, cubic_q], axis=2)
-                # convert back to RGB for storage/PSNR
-                rec_rgb = yiq_to_rgb(rec_yiq)
-                # clip and store
-                rec = np.clip(rec_rgb, 0, 1)
-            elif mode == 'yiq-all':
-                # convert test image to YIQ; expand each channel with its learned model
-                t_yiq = rgb_to_yiq(tt)
-                rec_yiq = np.zeros_like(t_yiq)
-                for ch in range(3):
-                    low = transform.resize(t_yiq[:, :, ch], (Hc // r, Wc // r), order=3, anti_aliasing=True, preserve_range=True)
-                    Hs, Ws = low.shape
-                    pad = m // 2
-                    low_padded = np.pad(low, pad, mode='edge')
-                    out = np.zeros((Hs * r, Ws * r))
-                    for i in range(Hs):
-                        for j in range(Ws):
-                            patch = low_padded[i:i+m, j:j+m].reshape(-1)
-                            xr = models[ch].transform_patch(patch)
-                            hi = i * r
-                            hj = j * r
-                            out[hi:hi+r, hj:hj+r] = xr.reshape((r, r))
-                    rec_yiq[:, :, ch] = out[:tt.shape[0], :tt.shape[1]]
-                # convert back to RGB
-                rec_rgb = yiq_to_rgb(rec_yiq)
-                rec = np.clip(rec_rgb, 0, 1)
-            reconstructed_imgs.append(rec)
-            psnr_list.append(sk_psnr(tt, rec, data_range=1.0))
-        val_learned = float(np.mean(psnr_list))
-        print('Mean PSNR on test set (learned):', val_learned)
-        # take first test image for visualization
-        img = test_imgs[0]
-        reconstructed = reconstructed_imgs[0]
-    else:
-        parser.error('No test images provided. Please supply --test-dir with images to run the demo (no astronaut fallback).')
-
-    # compute PSNR for learned expander (standard single-channel convention)
-    val_learned = sk_psnr(img, reconstructed, data_range=1.0)
-    print('PSNR RGB reconstructed vs original (learned):', val_learned)
-
-    # prepare cubic baseline: downsample then upsample with cubic (explicit shapes)
-    Hlow = img.shape[0] // r
-    Wlow = img.shape[1] // r
-    low_rgb = transform.resize(img, (Hlow, Wlow, 3), order=3, anti_aliasing=True, preserve_range=True)
-    cubic = transform.resize(low_rgb, img.shape, order=3, anti_aliasing=True, preserve_range=True)
-    # ensure in [0,1]
-    low_rgb = np.clip(low_rgb, 0, 1)
-    cubic = np.clip(cubic, 0, 1)
-    val_cubic = sk_psnr(img, cubic, data_range=1.0)
-    print('PSNR cubic baseline:', val_cubic)
-
-    # save comparison images
-    plt.imsave(out_dir / 'original.png', img)
-    plt.imsave(out_dir / 'low_res.png', low_rgb)
-    plt.imsave(out_dir / 'cubic.png', np.clip(cubic, 0, 1))
-    plt.imsave(out_dir / 'learned.png', np.clip(reconstructed, 0, 1))
-
-    # visualize learned supports per channel (label depending on mode)
+def fit_models(train_imgs, mode, args):
+    models = []
     if mode == 'rgb':
-        for ch, M_k in enumerate(learned_kernels):
-            support = np.mean(np.abs(M_k), axis=0)
-            support_map = support.reshape((m, m))
-            plt.figure(figsize=(4, 4))
-            plt.imshow(support_map, cmap='hot')
-            plt.colorbar()
-            plt.title(f'Channel {ch} learned support (mean abs weight)')
-            plt.savefig(out_dir / f'support_ch{ch}.png')
-            plt.close()
+        for ch in range(3):
+            y, x = channel_training_data(train_imgs, lambda img, c=ch: img[:, :, c], args.r, args.m)
+            models.append(fit_one_channel(y, x, args))
+    elif mode == 'yiq-luma':
+        y, x = channel_training_data(train_imgs, lambda img: rgb_to_yiq(img)[:, :, 0], args.r, args.m)
+        models.append(fit_one_channel(y, x, args))
+    elif mode == 'yiq-all':
+        for ch in range(3):
+            y, x = channel_training_data(train_imgs, lambda img, c=ch: rgb_to_yiq(img)[:, :, c], args.r, args.m)
+            models.append(fit_one_channel(y, x, args))
     else:
-        if mode == 'yiq-luma':
-            # only Y was learned (models[0])
-            M_k = learned_kernels[0]
-            support = np.mean(np.abs(M_k), axis=0)
-            support_map = support.reshape((m, m))
-            plt.figure(figsize=(4, 4))
-            plt.imshow(support_map, cmap='hot')
-            plt.colorbar()
-            plt.title('Learned support (Y channel)')
-            plt.savefig(out_dir / 'support_Y.png')
-            plt.close()
-        elif mode == 'yiq-all':
-            names = ['Y', 'I', 'Q']
-            for ch, name in enumerate(names):
-                M_k = learned_kernels[ch]
-                support = np.mean(np.abs(M_k), axis=0)
-                support_map = support.reshape((m, m))
-                plt.figure(figsize=(4, 4))
-                plt.imshow(support_map, cmap='hot')
-                plt.colorbar()
-                plt.title(f'Learned support ({name} channel)')
-                plt.savefig(out_dir / f'support_{name}.png')
-                plt.close()
+        raise ValueError(f'unknown mode: {mode}')
+    return models
 
-    # show a small summary figure
+
+def expand_image(models, img, mode, r, m):
+    img = crop_to_factor(img, r)
+    if mode == 'rgb':
+        rec = np.zeros_like(img)
+        lows = []
+        for ch in range(3):
+            rec[:, :, ch], low = expand_channel(models[ch], img[:, :, ch], r=r, m=m)
+            lows.append(low)
+        return np.clip(rec, 0.0, 1.0), np.stack(lows, axis=2)
+
+    yiq = rgb_to_yiq(img)
+    if mode == 'yiq-luma':
+        out_y, low_y = expand_channel(models[0], yiq[:, :, 0], r=r, m=m)
+        low_i = make_low_resolution(yiq[:, :, 1], r)
+        low_q = make_low_resolution(yiq[:, :, 2], r)
+        out_i = cubic_expand(low_i, img.shape[:2])
+        out_q = cubic_expand(low_q, img.shape[:2])
+        rec_yiq = np.stack([out_y, out_i, out_q], axis=2)
+        low_rgb = np.clip(yiq_to_rgb(np.stack([low_y, low_i, low_q], axis=2)), 0.0, 1.0)
+        return np.clip(yiq_to_rgb(rec_yiq), 0.0, 1.0), low_rgb
+
+    if mode == 'yiq-all':
+        rec_yiq = np.zeros_like(yiq)
+        lows = []
+        for ch in range(3):
+            rec_yiq[:, :, ch], low = expand_channel(models[ch], yiq[:, :, ch], r=r, m=m)
+            lows.append(low)
+        low_rgb = np.clip(yiq_to_rgb(np.stack(lows, axis=2)), 0.0, 1.0)
+        return np.clip(yiq_to_rgb(rec_yiq), 0.0, 1.0), low_rgb
+
+    raise ValueError(f'unknown mode: {mode}')
+
+
+def cubic_baseline(img, r):
+    img = crop_to_factor(img, r)
+    low = make_low_resolution(img, r)
+    return np.clip(cubic_expand(low, img.shape), 0.0, 1.0), np.clip(low, 0.0, 1.0)
+
+
+def evaluate_models(models, test_imgs, mode, r, m):
+    learned_scores = []
+    cubic_scores = []
+    first = None
+    for img in test_imgs:
+        img = crop_to_factor(img, r)
+        rec, low = expand_image(models, img, mode, r, m)
+        cubic, cubic_low = cubic_baseline(img, r)
+        learned_scores.append(sk_psnr(img, rec, data_range=1.0))
+        cubic_scores.append(sk_psnr(img, cubic, data_range=1.0))
+        if first is None:
+            first = (img, low, rec, cubic, cubic_low)
+    return learned_scores, cubic_scores, first
+
+
+def save_support_maps(models, mode, m, out_dir):
+    names = ['R', 'G', 'B'] if mode == 'rgb' else (['Y'] if mode == 'yiq-luma' else ['Y', 'I', 'Q'])
+    for name, model in zip(names, models):
+        support_map = model.support_union_mask().reshape((m, m)).astype(float)
+        plt.figure(figsize=(4, 4))
+        plt.imshow(support_map, cmap='gray', vmin=0, vmax=1)
+        plt.title(f'ARD support ({name}), size={model.support_size()}')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(out_dir / f'support_{name}.png', dpi=150)
+        plt.close()
+
+
+def save_demo_outputs(first, learned_scores, cubic_scores, mode, out_dir):
+    img, low, rec, cubic, _ = first
+    plt.imsave(out_dir / 'original.png', img)
+    plt.imsave(out_dir / 'low_res.png', np.clip(low, 0.0, 1.0))
+    plt.imsave(out_dir / 'cubic.png', np.clip(cubic, 0.0, 1.0))
+    plt.imsave(out_dir / 'learned.png', np.clip(rec, 0.0, 1.0))
+
     fig, axes = plt.subplots(1, 4, figsize=(12, 4))
     axes[0].imshow(img)
     axes[0].set_title('Original')
-    axes[1].imshow(low_rgb)
+    axes[1].imshow(np.clip(low, 0.0, 1.0))
     axes[1].set_title('Low-res')
-    axes[2].imshow(np.clip(cubic, 0, 1))
-    axes[2].set_title(f'Cubic {val_cubic:.2f} dB')
-    axes[3].imshow(np.clip(reconstructed, 0, 1))
-    axes[3].set_title(f'Learned ({mode}) {val_learned:.2f} dB')
+    axes[2].imshow(np.clip(cubic, 0.0, 1.0))
+    axes[2].set_title(f'Cubic {cubic_scores[0]:.2f} dB')
+    axes[3].imshow(np.clip(rec, 0.0, 1.0))
+    axes[3].set_title(f'{mode} {learned_scores[0]:.2f} dB')
     for ax in axes:
         ax.axis('off')
     fig.tight_layout()
-    fig.savefig(out_dir / 'comparison.png')
-    print('Saved outputs to', out_dir)
+    fig.savefig(out_dir / 'comparison.png', dpi=150)
+    plt.close(fig)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Sparse Bayesian image expansion demo')
+    parser.add_argument('--train-dir', type=str, default=TRAIN_DIR)
+    parser.add_argument('--test-dir', type=str, default=TEST_DIR)
+    parser.add_argument('--mode', choices=['rgb', 'yiq-luma', 'yiq-all'], default='yiq-all')
+    parser.add_argument('--r', type=int, default=R)
+    parser.add_argument('--m', type=int, default=PATCH_SIZE)
+    parser.add_argument('--a-alpha0', type=float, default=A_ALPHA0)
+    parser.add_argument('--b-alpha0', type=float, default=2e-8)
+    parser.add_argument('--a-beta0', type=float, default=1e-6)
+    parser.add_argument('--b-beta0', type=float, default=1e-6)
+    parser.add_argument('--max-iter', type=int, default=200)
+    parser.add_argument('--tol', type=float, default=1e-6)
+    parser.add_argument('--symmetry', choices=['none', 'h', 'v', 'hv'], default='hv')
+    parser.add_argument('--output-dir', type=str, default='demo_outputs')
+    parser.add_argument('--verbose', action='store_true')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    train_dir = Path(args.train_dir)
+    test_dir = Path(args.test_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not train_dir.exists():
+        raise SystemExit(f'training directory does not exist: {train_dir}')
+    if not test_dir.exists():
+        raise SystemExit(f'test directory does not exist: {test_dir}')
+
+    train_imgs = load_images_from_dir(train_dir)
+    test_imgs = load_images_from_dir(test_dir)
+    if not train_imgs:
+        raise SystemExit(f'no training images found in {train_dir}')
+    if not test_imgs:
+        raise SystemExit(f'no test images found in {test_dir}')
+
+    print(f'Loaded {len(train_imgs)} training images and {len(test_imgs)} test images')
+    print(f'Training mode={args.mode}, r={args.r}, m={args.m}, a_alpha0={args.a_alpha0}')
+
+    models = fit_models(train_imgs, args.mode, args)
+    learned_scores, cubic_scores, first = evaluate_models(models, test_imgs, args.mode, args.r, args.m)
+
+    print(f'Mean PSNR learned: {np.mean(learned_scores):.4f} dB')
+    print(f'Mean PSNR cubic baseline: {np.mean(cubic_scores):.4f} dB')
+    print('Support sizes:', [model.support_size() for model in models])
+
+    save_support_maps(models, args.mode, args.m, out_dir)
+    save_demo_outputs(first, learned_scores, cubic_scores, args.mode, out_dir)
+    print(f'Saved outputs to {out_dir}')
 
 
 if __name__ == '__main__':

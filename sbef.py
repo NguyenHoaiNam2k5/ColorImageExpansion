@@ -3,215 +3,259 @@ from scipy.linalg import cho_factor, cho_solve
 
 
 class SparseBayesExpander:
-    """Sparse Bayesian Expander with symmetry and tied-alpha support.
+    """One-channel sparse Bayesian image-expansion filter.
 
-    Implements a variational ARD model for x = W y + eps (x in R^D, y in R^Q).
+    This class implements the variational ARD learning algorithm used by
+    Kanemura, Maeda, and Ishii for the scalar-channel model
 
-    Paper mapping (informal):
-    - q(W_d) = N(M_d, Sigma_d) where M_d is row d of self.M and Sigma_d is self.Sigmas[d]
-      (corresponds to posterior over W rows in the paper).
-    - q(alpha) ~ Gamma(a_alpha, b_alpha) : controls per-weight (or per-group) precision.
-    - q(beta) ~ Gamma(a_beta, b_beta) : noise precision.
+        x = W y + eps,
 
-    symmetry: 'none' | 'h' | 'v' | 'hv' groups indices of the m x m low-res patch.
-    tie_alpha_across_rows: if True, the same alpha (or group-alpha) is shared across all D rows.
+    where y is an m x m low-resolution patch flattened to length Q and x is an
+    r x r high-resolution patch flattened to length D.  Color handling is done
+    outside this class by fitting one model per RGB/YIQ channel.
+
+    The paper's independent ARD precisions are alpha[d, q].  When ``symmetry``
+    is enabled, this implementation ties alpha values only for coefficients
+    that are related by the paper's horizontal/vertical symmetry over both the
+    output sub-pixel index d and the input patch index q.  It does not tie a
+    single alpha across all output rows.
     """
 
-    def __init__(self, D, Q, a_alpha0=20.0, b_alpha0=1e-6, a_beta0=1e-6, b_beta0=1e-6,
-                 alpha_threshold=np.exp(20), max_iter=200, tol=1e-6, verbose=False,
-                 symmetry='hv', tie_alpha_across_rows=True):
-        self.D = D
-        self.Q = Q
-        self.a_alpha0 = a_alpha0
-        self.b_alpha0 = b_alpha0
-        self.a_beta0 = a_beta0
-        self.b_beta0 = b_beta0
-        self.alpha_threshold = alpha_threshold
-        self.max_iter = max_iter
-        self.tol = tol
-        self.verbose = verbose
+    def __init__(self, D, Q, a_alpha0=20.0, b_alpha0=2e-8,
+                 a_beta0=1e-6, b_beta0=1e-6, alpha_threshold=np.exp(20),
+                 max_iter=200, tol=1e-6, verbose=False, symmetry='hv',
+                 tie_alpha_across_rows=None):
+        self.D = int(D)
+        self.Q = int(Q)
+        self.a_alpha0 = float(a_alpha0)
+        self.b_alpha0 = float(b_alpha0)
+        self.a_beta0 = float(a_beta0)
+        self.b_beta0 = float(b_beta0)
+        self.alpha_threshold = float(alpha_threshold)
+        self.max_iter = int(max_iter)
+        self.tol = float(tol)
+        self.verbose = bool(verbose)
 
         if symmetry not in ('none', 'h', 'v', 'hv'):
-            raise ValueError("symmetry must be one of 'none','h','v','hv'")
+            raise ValueError("symmetry must be one of 'none', 'h', 'v', 'hv'")
         self.symmetry = symmetry
-        self.tie_alpha_across_rows = bool(tie_alpha_across_rows)
 
-        # Posterior parameters
-        self.M = np.zeros((D, Q), dtype=float)  # posterior means (D x Q)
-        self.Sigmas = [np.eye(Q, dtype=float) for _ in range(D)]  # list of QxQ covariances
+        # Kept only for backwards compatibility with older versions of this
+        # educational repo.  The paper-symmetric implementation below ignores
+        # row-wise tying because the paper ties alpha over symmetric (d, q)
+        # pairs, not across all d for the same q.
+        self.tie_alpha_across_rows = tie_alpha_across_rows
 
-        # Build symmetry groups (map q -> group id) when requested
-        self.group_of_q = None
-        self.groups = None
-        if self.symmetry != 'none':
-            m = int(round(np.sqrt(Q)))
-            if m * m != Q:
-                raise ValueError('Q must be a perfect square for symmetry')
-            groups_map = {}
-            for q in range(Q):
-                i = q // m
-                j = q % m
-                s = {(i, j)}
-                if 'h' in self.symmetry:
-                    s.add((i, m - 1 - j))
-                if 'v' in self.symmetry:
-                    s.add((m - 1 - i, j))
-                if self.symmetry == 'hv':
-                    s.add((m - 1 - i, m - 1 - j))
-                idxs = tuple(sorted(ii * m + jj for (ii, jj) in s))
-                groups_map.setdefault(idxs, set()).add(q)
-            # groups: list of lists of q indices that belong to the same symmetry group
-            self.groups = [sorted(list(k)) for k in groups_map.keys()]
-            self.group_of_q = np.empty(Q, dtype=int)
-            for gid, qlist in enumerate(self.groups):
-                for q in qlist:
-                    self.group_of_q[q] = gid
+        self.M = np.zeros((self.D, self.Q), dtype=np.float64)
+        self.Sigmas = [np.eye(self.Q, dtype=np.float64) for _ in range(self.D)]
 
-        # Initialize alpha posterior parameters depending on tie/group config
-        if self.tie_alpha_across_rows:
-            if self.groups is not None:
-                G = len(self.groups)
-                self.a_alpha = np.ones(G, dtype=float) * (self.a_alpha0 + 0.5)
-                self.b_alpha = np.ones(G, dtype=float) * (self.b_alpha0 + 1e-8)
-            else:
-                self.a_alpha = np.ones(Q, dtype=float) * (self.a_alpha0 + 0.5)
-                self.b_alpha = np.ones(Q, dtype=float) * (self.b_alpha0 + 1e-8)
-        else:
-            if self.groups is not None:
-                G = len(self.groups)
-                self.a_alpha = np.ones((D, G), dtype=float) * (self.a_alpha0 + 0.5)
-                self.b_alpha = np.ones((D, G), dtype=float) * (self.b_alpha0 + 1e-8)
-            else:
-                self.a_alpha = np.ones((D, Q), dtype=float) * (self.a_alpha0 + 0.5)
-                self.b_alpha = np.ones((D, Q), dtype=float) * (self.b_alpha0 + 1e-8)
+        self.alpha_groups, self.pair_to_group = self._build_alpha_groups()
+        self.n_alpha_groups = len(self.alpha_groups)
+        self.a_alpha = np.full(self.n_alpha_groups, self.a_alpha0 + 0.5,
+                               dtype=np.float64)
+        self.b_alpha = np.full(self.n_alpha_groups, self.b_alpha0 + 1e-8,
+                               dtype=np.float64)
+        self.Ealpha = self._expand_group_values(self.a_alpha / self.b_alpha)
+        self.pruned_mask = self.Ealpha > self.alpha_threshold
 
-        # beta posterior params
         self.a_beta = self.a_beta0
         self.b_beta = self.b_beta0
+        self.n_iter_ = 0
+        self.converged_ = False
+
+    @staticmethod
+    def _square_side(n, name):
+        side = int(round(np.sqrt(n)))
+        if side * side != n:
+            raise ValueError(f'{name} must be a perfect square')
+        return side
+
+    def _symmetry_orbit(self, d, q):
+        """Return all (d, q) pairs related by requested patch symmetries."""
+        if self.symmetry == 'none':
+            return {(d, q)}
+
+        r = self._square_side(self.D, 'D')
+        m = self._square_side(self.Q, 'Q')
+        du, dv = divmod(d, r)
+        qi, qj = divmod(q, m)
+
+        transforms = [(False, False)]
+        if 'h' in self.symmetry:
+            transforms.append((True, False))
+        if 'v' in self.symmetry:
+            transforms.append((False, True))
+        if self.symmetry == 'hv':
+            transforms.append((True, True))
+
+        orbit = set()
+        for flip_h, flip_v in transforms:
+            ndu = r - 1 - du if flip_v else du
+            ndv = r - 1 - dv if flip_h else dv
+            nqi = m - 1 - qi if flip_v else qi
+            nqj = m - 1 - qj if flip_h else qj
+            orbit.add((ndu * r + ndv, nqi * m + nqj))
+        return orbit
+
+    def _build_alpha_groups(self):
+        """Build paper-style groups over coefficient pairs (d, q)."""
+        groups_by_key = {}
+        for d in range(self.D):
+            for q in range(self.Q):
+                key = tuple(sorted(self._symmetry_orbit(d, q)))
+                groups_by_key.setdefault(key, list(key))
+
+        groups = list(groups_by_key.values())
+        pair_to_group = np.empty((self.D, self.Q), dtype=np.int64)
+        for gid, pairs in enumerate(groups):
+            for d, q in pairs:
+                pair_to_group[d, q] = gid
+        return groups, pair_to_group
+
+    def _expand_group_values(self, group_values):
+        out = np.empty((self.D, self.Q), dtype=np.float64)
+        for gid, pairs in enumerate(self.alpha_groups):
+            for d, q in pairs:
+                out[d, q] = group_values[gid]
+        return out
+
+    def _update_alpha(self):
+        """Update q(alpha) from E[w_dq^2] = mu_dq^2 + Sigma_d[qq]."""
+        W2 = np.empty((self.D, self.Q), dtype=np.float64)
+        for d in range(self.D):
+            W2[d] = self.M[d] ** 2 + np.diag(self.Sigmas[d])
+
+        a_new = np.empty(self.n_alpha_groups, dtype=np.float64)
+        b_new = np.empty(self.n_alpha_groups, dtype=np.float64)
+        for gid, pairs in enumerate(self.alpha_groups):
+            sum_w2 = 0.0
+            for d, q in pairs:
+                sum_w2 += W2[d, q]
+            n_weights = len(pairs)
+            a_new[gid] = self.a_alpha0 + 0.5 * n_weights
+            b_new[gid] = self.b_alpha0 + 0.5 * sum_w2
+
+            # a_new[gid] = n_weights * self.a_alpha0 + 0.5 * n_weights
+            # b_new[gid] = n_weights * self.b_alpha0 + 0.5 * sum_w2
+
+            # a_new[gid] = n_weights * self.a_alpha0 - 0.5 * n_weights + 1.0
+            # b_new[gid] = n_weights * self.b_alpha0 + 0.5 * sum_w2
+
+        self.a_alpha = a_new
+        self.b_alpha = b_new
+        self.Ealpha = self._expand_group_values(self.a_alpha / self.b_alpha)
+        self.pruned_mask = self.Ealpha > self.alpha_threshold
 
     def fit(self, Y, X):
-        """Train with Y (Q x N) low-res patches and X (D x N) high-res patches.
+        """Fit the variational sparse Bayesian filter.
 
-        Algorithm (high-level): iterate updates for q(W), q(alpha), q(beta).
-
-        Paper-equation mapping (sketch):
-        - Sigma_d = (Diag(E[alpha]_d) + E[beta] S_yy)^{-1}
-        - mu_d = E[beta] Sigma_d Ty[d].T
-        - a_alpha/b_alpha from expectations of w^2 over tied groups
-        - a_beta/b_beta from residuals + trace(Ssum S_yy)
+        Parameters
+        ----------
+        Y : ndarray, shape (Q, N)
+            Low-resolution patches.
+        X : ndarray, shape (D, N)
+            Corresponding high-resolution r x r patches.
         """
+        Y = np.asarray(Y, dtype=np.float64)
+        X = np.asarray(X, dtype=np.float64)
+        if Y.ndim != 2 or X.ndim != 2:
+            raise ValueError('Y and X must be 2-D arrays with shapes (Q, N) and (D, N)')
+
         Q, N = Y.shape
         D, N2 = X.shape
-        assert Q == self.Q and D == self.D and N == N2
+        if Q != self.Q or D != self.D or N != N2:
+            raise ValueError(
+                f'expected Y shape ({self.Q}, N) and X shape ({self.D}, N); '
+                f'got {Y.shape} and {X.shape}'
+            )
+        if N == 0:
+            raise ValueError('empty training set')
 
         S_yy = Y @ Y.T
-        Ty = [X[d, :] @ Y.T for d in range(D)]
+        Ty = X @ Y.T  # shape (D, Q), Ty[d] = sum_n x_nd y_n^T
 
-        # initialize beta posterior
-        self.a_beta = self.a_beta0 + 0.5 * N * D
-        self.b_beta = self.b_beta0 + 0.5 * np.sum(X**2)
+        self.a_beta = self.a_beta0 + 0.5 * N * self.D
+        self.b_beta = self.b_beta0 + 0.5 * np.sum(X ** 2)
 
         prev_M = self.M.copy()
+        self.converged_ = False
 
         for it in range(self.max_iter):
-            # Expected squared weights: E[w^2] = mu^2 + diag(Sigma)
-            W2 = np.zeros((D, Q), dtype=float)
-            for d in range(D):
-                W2[d, :] = self.M[d] ** 2 + np.diag(self.Sigmas[d])
-
-            # Update alpha posterior parameters depending on grouping/ties
-            if self.tie_alpha_across_rows:
-                # Single alpha per group/q across rows
-                if self.groups is not None:
-                    G = len(self.groups)
-                    a_new = np.empty(G, dtype=float)
-                    b_new = np.empty(G, dtype=float)
-                    for gid, qlist in enumerate(self.groups):
-                        sum_w2 = np.sum(W2[:, qlist])  # sum over rows and q in group
-                        n_weights = D * len(qlist)
-                        b_new[gid] = self.b_alpha0 + 0.5 * sum_w2
-                        a_new[gid] = self.a_alpha0 + 0.5 * n_weights
-                    self.a_alpha = a_new
-                    self.b_alpha = b_new
-                    # expand to per-weight Ealpha (D x Q)
-                    Ealpha = np.empty((D, Q), dtype=float)
-                    for q in range(Q):
-                        gid = self.group_of_q[q]
-                        Ealpha[:, q] = self.a_alpha[gid] / self.b_alpha[gid]
-                else:
-                    # per-q shared across rows
-                    sum_w2 = np.sum(W2, axis=0)
-                    b_new = self.b_alpha0 + 0.5 * sum_w2
-                    a_new = self.a_alpha0 + 0.5 * D
-                    self.a_alpha = np.ones(Q, dtype=float) * a_new
-                    self.b_alpha = b_new
-                    Ealpha = np.tile(self.a_alpha / self.b_alpha, (D, 1))
-            else:
-                # Alphas not tied across rows
-                if self.groups is not None:
-                    G = len(self.groups)
-                    a_new = np.empty((D, G), dtype=float)
-                    b_new = np.empty((D, G), dtype=float)
-                    for d in range(D):
-                        for gid, qlist in enumerate(self.groups):
-                            sum_w2 = np.sum(W2[d, qlist])
-                            n_weights = len(qlist)
-                            b_new[d, gid] = self.b_alpha0 + 0.5 * sum_w2
-                            a_new[d, gid] = self.a_alpha0 + 0.5 * n_weights
-                    # expand to per-weight arrays
-                    self.a_alpha = np.zeros((D, Q), dtype=float)
-                    self.b_alpha = np.zeros((D, Q), dtype=float)
-                    Ealpha = np.empty((D, Q), dtype=float)
-                    for q in range(Q):
-                        gid = self.group_of_q[q]
-                        self.a_alpha[:, q] = a_new[:, gid]
-                        self.b_alpha[:, q] = b_new[:, gid]
-                        Ealpha[:, q] = self.a_alpha[:, q] / self.b_alpha[:, q]
-                else:
-                    # fully independent per-weight
-                    self.b_alpha = self.b_alpha0 + 0.5 * W2
-                    self.a_alpha = self.a_alpha0 + 0.5
-                    Ealpha = self.a_alpha / self.b_alpha
-
-            # prune huge alphas for numeric stability
-            Ealpha = np.where(Ealpha > self.alpha_threshold, np.inf, Ealpha)
-
-            # Update q(W): per-row Gaussian
+            self._update_alpha()
             E_beta = self.a_beta / self.b_beta
-            for d in range(D):
-                A_d = np.diag(Ealpha[d]) + E_beta * S_yy
-                try:
-                    c, low = cho_factor(A_d, check_finite=False)
-                    Sigma_d = cho_solve((c, low), np.eye(Q), check_finite=False)
-                except np.linalg.LinAlgError:
-                    Sigma_d = np.linalg.pinv(A_d)
+
+            for d in range(self.D):
+                active = np.isfinite(self.Ealpha[d]) & (self.Ealpha[d] <= self.alpha_threshold)
+                Sigma_d = np.zeros((self.Q, self.Q), dtype=np.float64)
+                mu_d = np.zeros(self.Q, dtype=np.float64)
+
+                if np.any(active):
+                    idx = np.flatnonzero(active)
+                    A = (np.diag(self.Ealpha[d, idx]) +
+                         E_beta * S_yy[np.ix_(idx, idx)])
+                    rhs = Ty[d, idx]
+
+                    try:
+                        c, low = cho_factor(A, check_finite=False)
+                        Sigma_active = cho_solve((c, low), np.eye(len(idx)), check_finite=False)
+                        mu_active = E_beta * cho_solve((c, low), rhs, check_finite=False)
+                    except np.linalg.LinAlgError:
+                        Sigma_active = np.linalg.pinv(A)
+                        mu_active = E_beta * (Sigma_active @ rhs)
+
+                    Sigma_d[np.ix_(idx, idx)] = Sigma_active
+                    mu_d[idx] = mu_active
+
                 self.Sigmas[d] = Sigma_d
-                # mu_d = E_beta * Sigma_d @ Ty[d].T  (paper equation)
-                self.M[d] = E_beta * (Sigma_d @ Ty[d].T)
+                self.M[d] = mu_d
 
-            # Update q(beta)
-            Ssum = np.zeros((Q, Q), dtype=float)
-            for d in range(D):
-                Ssum += self.Sigmas[d]
-            residual = X - (self.M @ Y)
-            sum_sq = np.sum(residual**2)
-            trace_part = float(np.trace(Ssum @ S_yy))
-            sum_err = sum_sq + trace_part
+            Ssum = np.zeros((self.Q, self.Q), dtype=np.float64)
+            for Sigma_d in self.Sigmas:
+                Ssum += Sigma_d
+
+            residual = X - self.M @ Y
+            sum_err = float(np.sum(residual ** 2) + np.trace(Ssum @ S_yy))
             self.b_beta = self.b_beta0 + 0.5 * sum_err
-            self.a_beta = self.a_beta0 + 0.5 * N * D
+            self.a_beta = self.a_beta0 + 0.5 * N * self.D
 
-            # convergence check
-            normM = np.linalg.norm(self.M, 'fro')
-            delta = np.linalg.norm(self.M - prev_M, 'fro') / max(1e-12, normM)
+            prev_norm_M = np.linalg.norm(prev_M, 'fro')
+            delta = np.linalg.norm(self.M - prev_M, 'fro') / max(1e-12, prev_norm_M)
+            self.n_iter_ = it + 1
+
             if self.verbose:
-                print(f'it={it} delta={delta:.3e} E_beta={(self.a_beta/self.b_beta):.3e}')
+                active_count = int(np.sum(self.active_mask()))
+                print(
+                    f'it={it:03d} delta={delta:.3e} '
+                    f'E_beta={(self.a_beta / self.b_beta):.3e} active={active_count}'
+                )
+
             if delta < self.tol:
+                self.converged_ = True
                 break
             prev_M = self.M.copy()
 
         return self
 
     def transform_patch(self, y):
-        """Apply learned filter to a single low-res patch y (Q,) -> x (D,)."""
-        return (self.M @ y).reshape(self.D)
+        """Apply the learned posterior-mean filter to one low-resolution patch."""
+        y = np.asarray(y, dtype=np.float64).reshape(self.Q)
+        return self.M @ y
 
+    def active_mask(self):
+        """Boolean mask of coefficients kept after the paper's exp(20) ARD cutoff."""
+        return np.isfinite(self.Ealpha) & (self.Ealpha <= self.alpha_threshold)
+
+    def support_union_mask(self):
+        """Input-pixel support used by at least one output sub-pixel filter row."""
+        return np.any(self.active_mask(), axis=0)
+
+    def support_size(self, union=True):
+        """Return active support size.
+
+        union=True counts input pixels active in at least one output sub-pixel row.
+        union=False counts all active coefficients over all rows.
+        For Fig. 3-style support, use mean_row_support_size / paper_support_size.
+        """
+        if union:
+            return int(np.sum(self.support_union_mask()))
+        return int(np.sum(self.active_mask()))
